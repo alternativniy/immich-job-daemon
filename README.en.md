@@ -86,15 +86,19 @@ docker run -d \
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `IMMICH_URL` | Immich server URL | `http://127.0.0.1:2283` | No |
-| `API_KEY` | Immich API key | - | **Yes** |
+| `API_KEY` | Immich API key with `job.read` and `job.create` permissions | - | **Yes** |
 | `MAX_CONCURRENT_JOBS` | Number of jobs running concurrently | `1` | No |
 
 ## Getting API Key
 
 1. Log in to Immich web interface
 2. Go to **Account Settings** → **API Keys**
-3. Create a new API key
+3. Create a new API key with required permissions:
+   - ✅ `job.read` - to read job status
+   - ✅ `job.create` - to manage jobs (pause/resume)
 4. Copy and use it in the `API_KEY` variable
+
+> **⚠️ Important:** API key must have `job.read` and `job.create` permissions, otherwise the daemon won't be able to manage jobs.
 
 ## Logs
 
