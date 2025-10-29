@@ -12,6 +12,7 @@ services:
       - IMMICH_URL=http://127.0.0.1:2283
       - API_KEY=your_api_key_here
       - MAX_CONCURRENT_JOBS=1
+      - POLL_INTERVAL=10
     depends_on:
       - immich-server
     networks:

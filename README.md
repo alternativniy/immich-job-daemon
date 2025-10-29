@@ -21,13 +21,15 @@
 Задания обрабатываются в следующем порядке приоритета:
 
 1. metadataExtraction
-2. storageTemplateMigration
-3. thumbnailGeneration
-4. smartSearch
-5. duplicateDetection
-6. faceDetection
-7. facialRecognition
-8. videoConversion
+2. sidecar
+3. storageTemplateMigration
+4. thumbnailGeneration
+5. smartSearch
+6. duplicateDetection
+7. faceDetection
+8. facialRecognition
+9. videoConversion
+10. other jobs
 
 ## Использование
 
@@ -94,6 +96,7 @@ docker run -d \
 | `IMMICH_URL` | URL сервера Immich | `http://127.0.0.1:2283` | Нет |
 | `API_KEY` | API ключ Immich с разрешениями `job.read` и `job.create` | - | **Да** |
 | `MAX_CONCURRENT_JOBS` | Количество одновременно выполняемых заданий | `1` | Нет |
+| `POLL_INTERVAL` | Интервал опроса в секундах | `10` | Нет |
 
 ## Получение API ключа
 

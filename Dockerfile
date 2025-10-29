@@ -30,7 +30,8 @@ USER immich
 
 # Set default environment variables (can be overridden at runtime)
 ENV IMMICH_URL=http://127.0.0.1:2283 \
-  MAX_CONCURRENT_JOBS=1
+  MAX_CONCURRENT_JOBS=1 \
+  POLL_INTERVAL=10
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

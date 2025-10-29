@@ -21,13 +21,15 @@ A daemon for managing Immich job queue. Automatically manages jobs by priority, 
 Jobs are processed in the following priority order:
 
 1. metadataExtraction
-2. storageTemplateMigration
-3. thumbnailGeneration
-4. smartSearch
-5. duplicateDetection
-6. faceDetection
-7. facialRecognition
-8. videoConversion
+2. sidecar
+3. storageTemplateMigration
+4. thumbnailGeneration
+5. smartSearch
+6. duplicateDetection
+7. faceDetection
+8. facialRecognition
+9. videoConversion
+10. other jobs
 
 ## Usage
 
@@ -62,6 +64,7 @@ docker run -d \
 ### Docker Compose
 
 1. Edit `docker-compose.yml`:
+
    ```yaml
    services:
      immich-job-daemon:
@@ -94,6 +97,7 @@ docker run -d \
 | `IMMICH_URL` | Immich server URL | `http://127.0.0.1:2283` | No |
 | `API_KEY` | Immich API key with `job.read` and `job.create` permissions | - | **Yes** |
 | `MAX_CONCURRENT_JOBS` | Number of jobs running concurrently | `1` | No |
+| `POLL_INTERVAL` | Polling interval in seconds | `10` | No |
 
 ## Getting API Key
 
@@ -126,6 +130,7 @@ The daemon runs every 10 seconds:
 This allows efficient server resource management by processing jobs sequentially or in parallel according to priority.
 
 **Usage Examples:**
+
 - `MAX_CONCURRENT_JOBS=1` - jobs run strictly sequentially (default)
 - `MAX_CONCURRENT_JOBS=2` - two jobs can run simultaneously
 - `MAX_CONCURRENT_JOBS=3` - three jobs can run simultaneously

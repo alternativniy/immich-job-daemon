@@ -5,7 +5,11 @@
 IMMICH_URL="${IMMICH_URL:-http://127.0.0.1:2283}"
 API_KEY="${API_KEY:-}"
 MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-1}"
+POLL_INTERVAL="${POLL_INTERVAL:-10}"
 URL="${IMMICH_URL}/api/jobs"
+
+# Variable to store previous job states
+PREV_JOB_STATES=""
 
 # Validate required environment variables
 if [ -z "$API_KEY" ]; then
@@ -19,9 +23,16 @@ if ! echo "$MAX_CONCURRENT_JOBS" | grep -qE '^[1-9][0-9]*$'; then
     exit 1
 fi
 
+# Validate POLL_INTERVAL is a positive integer
+if ! echo "$POLL_INTERVAL" | grep -qE '^[1-9][0-9]*$'; then
+    echo "ERROR: POLL_INTERVAL must be a positive integer" >&2
+    exit 1
+fi
+
 echo "Starting Immich Job Daemon..."
 echo "Immich URL: $IMMICH_URL"
 echo "Max concurrent jobs: $MAX_CONCURRENT_JOBS"
+echo "Poll interval: ${POLL_INTERVAL}s"
 
 # Check server availability
 echo "Checking Immich server availability..."
@@ -87,19 +98,44 @@ manage_jobs() {
     fi
     
     # List of jobs to manage in priority order
-    managed_job_list="metadataExtraction storageTemplateMigration thumbnailGeneration smartSearch duplicateDetection faceDetection facialRecognition videoConversion"
+    priority_job_list="metadataExtraction sidecar storageTemplateMigration thumbnailGeneration smartSearch duplicateDetection faceDetection facialRecognition videoConversion"
+    
+    # Get all available jobs from the API response
+    all_jobs=$(echo "$jobs" | jq -r 'keys[]' 2>/dev/null)
+    
+    # Build complete managed job list: priority jobs first, then other jobs
+    # Use grep for faster lookups instead of nested loops
+    managed_job_list="$priority_job_list"
+    for job in $all_jobs; do
+        # Check if job is not in priority list using grep (O(n) instead of O(n²))
+        if ! echo " $priority_job_list " | grep -q " $job "; then
+            managed_job_list="$managed_job_list $job"
+        fi
+    done
     
     # Collect jobs with activity and unpause the first N jobs based on MAX_CONCURRENT_JOBS
     jobs_to_unpause=""
     jobs_unpaused=0
     
     for job in $managed_job_list; do
-        active=$(echo "$jobs" | jq -r ".$job.jobCounts.active // 0")
-        waiting=$(echo "$jobs" | jq -r ".$job.jobCounts.waiting // 0")
-        paused=$(echo "$jobs" | jq -r ".$job.jobCounts.paused // 0")
-        delayed=$(echo "$jobs" | jq -r ".$job.jobCounts.delayed // 0")
+        # Optimize: Get all counts in one jq call instead of 4 separate calls
+        job_counts=$(echo "$jobs" | jq -r ".$job.jobCounts | \"\(.active // 0) \(.waiting // 0) \(.paused // 0) \(.delayed // 0)\"" 2>/dev/null)
         
-        if [ "$active" -gt 0 ] || [ "$waiting" -gt 0 ] || [ "$paused" -gt 0 ] || [ "$delayed" -gt 0 ]; then
+        if [ -z "$job_counts" ]; then
+            continue
+        fi
+        
+        # Parse the space-separated values
+        set -- $job_counts
+        active=$1
+        waiting=$2
+        paused=$3
+        delayed=$4
+        
+        # Calculate total activity in one operation
+        total=$((active + waiting + paused + delayed))
+        
+        if [ "$total" -gt 0 ]; then
             if [ "$jobs_unpaused" -lt "$MAX_CONCURRENT_JOBS" ]; then
                 jobs_to_unpause="$jobs_to_unpause $job"
                 jobs_unpaused=$((jobs_unpaused + 1))
@@ -107,28 +143,50 @@ manage_jobs() {
         fi
     done
     
+    # Build new state string for comparison
+    new_job_states=""
+    
     # Unpause selected jobs, pause all others in managed_job_list
     for job in $managed_job_list; do
-        should_unpause=0
-        for unpause_job in $jobs_to_unpause; do
-            if [ "$job" = "$unpause_job" ]; then
-                should_unpause=1
-                break
-            fi
-        done
-        
-        if [ "$should_unpause" -eq 1 ]; then
-            # echo "Unpausing job: $job"
-            set_job "$job" "resume"
+        # Use grep for faster lookup (O(n) instead of O(n²))
+        if echo " $jobs_to_unpause " | grep -q " $job "; then
+            new_state="resume"
         else
-            # echo "Pausing job: $job"
-            set_job "$job" "pause"
+            new_state="pause"
+        fi
+        
+        # Add to new state
+        new_job_states="${new_job_states}${job}:${new_state},"
+        
+        # Only execute command and log if state changed
+        if ! echo "$PREV_JOB_STATES" | grep -q "${job}:${new_state}"; then
+            if [ "$new_state" = "resume" ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] ▶️  Resuming job: $job"
+            else
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏸️  Pausing job: $job"
+            fi
+            set_job "$job" "$new_state"
         fi
     done
+    
+    # Update previous state
+    PREV_JOB_STATES="$new_job_states"
 }
 
-# Run the job manager loop every 10 seconds
+# Graceful shutdown handler
+cleanup() {
+    echo ""
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🛑 Received shutdown signal, exiting gracefully..."
+    exit 0
+}
+
+# Trap SIGTERM and SIGINT for graceful shutdown
+trap cleanup TERM INT
+
+# Run the job manager loop
+echo "🚀 Job daemon started. Press Ctrl+C to stop."
+echo ""
 while true; do
     manage_jobs
-    sleep 10
+    sleep "$POLL_INTERVAL"
 done
