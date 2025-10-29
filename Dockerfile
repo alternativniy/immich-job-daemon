@@ -9,8 +9,8 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 # Install required packages
 RUN apk add --no-cache \
-    curl \
-    jq
+  curl \
+  jq
 
 # Create a non-root user to run the daemon
 RUN adduser -D -u 1000 immich
@@ -23,19 +23,18 @@ COPY job-daemon.sh /app/job-daemon.sh
 
 # Make the script executable
 RUN chmod +x /app/job-daemon.sh && \
-    chown immich:immich /app/job-daemon.sh
+  chown immich:immich /app/job-daemon.sh
 
 # Switch to non-root user
 USER immich
 
 # Set default environment variables (can be overridden at runtime)
 ENV IMMICH_URL=http://127.0.0.1:2283 \
-    API_KEY="" \
-    MAX_CONCURRENT_JOBS=1
+  MAX_CONCURRENT_JOBS=1
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD pgrep -f job-daemon.sh || exit 1
+  CMD pgrep -f job-daemon.sh || exit 1
 
 # Run the daemon
 CMD ["/app/job-daemon.sh"]

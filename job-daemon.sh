@@ -23,6 +23,35 @@ echo "Starting Immich Job Daemon..."
 echo "Immich URL: $IMMICH_URL"
 echo "Max concurrent jobs: $MAX_CONCURRENT_JOBS"
 
+# Check server availability
+echo "Checking Immich server availability..."
+if ! curl -s -f -o /dev/null --connect-timeout 10 "$IMMICH_URL/api/server/ping"; then
+    echo "ERROR: Cannot connect to Immich server at $IMMICH_URL" >&2
+    echo "Please check that:" >&2
+    echo "  - IMMICH_URL is correct" >&2
+    echo "  - Immich server is running" >&2
+    echo "  - Network connection is available" >&2
+    exit 1
+fi
+echo "✓ Successfully connected to Immich server"
+
+# Verify API key by fetching jobs
+echo "Verifying API key..."
+test_response=$(curl -s -w "%{http_code}" -o /dev/null -X GET "$URL" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+-H "x-api-key: $API_KEY")
+
+if [ "$test_response" = "401" ] || [ "$test_response" = "403" ]; then
+    echo "ERROR: API key is invalid or does not have required permissions" >&2
+    echo "Please ensure the API key has 'job.read' and 'job.create' permissions" >&2
+    exit 1
+    elif [ "$test_response" != "200" ]; then
+    echo "WARNING: Unexpected response code: $test_response" >&2
+fi
+echo "✓ API key verified successfully"
+echo ""
+
 # Function to fetch the current job statuses from the API
 fetch_jobs() {
     curl -s -X GET "$URL" \

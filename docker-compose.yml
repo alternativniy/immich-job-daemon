@@ -9,12 +9,10 @@ services:
     container_name: immich-job-daemon
     restart: unless-stopped
     environment:
-      - IMMICH_URL=http://immich-server:2283
+      - IMMICH_URL=http://127.0.0.1:2283
       - API_KEY=your_api_key_here
       - MAX_CONCURRENT_JOBS=1
+    depends_on:
+      - immich-server
     networks:
       - immich_network
-
-networks:
-  immich_network:
-    external: true

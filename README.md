@@ -71,15 +71,21 @@ docker run -d \
        container_name: immich-job-daemon
        restart: unless-stopped
        environment:
-         - IMMICH_URL=http://immich-server:2283
+         - IMMICH_URL=http://127.0.0.1:2283
          - API_KEY=your_api_key_here
          - MAX_CONCURRENT_JOBS=2
+       depends_on:
+         - immich-server
+       networks:
+         - immich_network
    ```
 
 2. Запустите контейнер:
    ```bash
    docker-compose up -d
    ```
+
+> **📝 Примечание:** Демон зависит от `immich-server` и должен быть в той же Docker сети для доступа к API.
 
 ## Переменные окружения
 
@@ -127,8 +133,10 @@ docker logs -f immich-job-daemon
 ## Требования
 
 - Docker или Docker Compose
+- **Запущенный сервер Immich** (контейнер `immich-server`)
 - Доступ к Immich API
-- Действительный API ключ Immich
+- Действительный API ключ Immich с разрешениями `job.read` и `job.create`
+- Контейнер должен находиться в той же Docker сети, что и Immich
 
 ## Лицензия
 

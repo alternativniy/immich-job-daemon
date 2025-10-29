@@ -71,15 +71,21 @@ docker run -d \
        container_name: immich-job-daemon
        restart: unless-stopped
        environment:
-         - IMMICH_URL=http://immich-server:2283
+         - IMMICH_URL=http://127.0.0.1:2283
          - API_KEY=your_api_key_here
          - MAX_CONCURRENT_JOBS=2
+       depends_on:
+         - immich-server
+       networks:
+         - immich_network
    ```
 
 2. Start the container:
    ```bash
    docker-compose up -d
    ```
+
+> **📝 Note:** The daemon depends on `immich-server` and must be in the same Docker network to access the API.
 
 ## Environment Variables
 
@@ -127,8 +133,10 @@ This allows efficient server resource management by processing jobs sequentially
 ## Requirements
 
 - Docker or Docker Compose
+- **Running Immich server** (`immich-server` container)
 - Access to Immich API
-- Valid Immich API key
+- Valid Immich API key with `job.read` and `job.create` permissions
+- Container must be in the same Docker network as Immich
 
 ## License
 
