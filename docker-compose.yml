@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  immich-job-daemon:
+    # Use pre-built image from GitHub Container Registry
+    image: ghcr.io/alternativniy/immich-job-daemon:latest
+    # Or build locally by uncommenting the line below and commenting out the image line
+    # build: .
+    container_name: immich-job-daemon
+    restart: unless-stopped
+    environment:
+      - IMMICH_URL=http://immich-server:2283
+      - API_KEY=your_api_key_here
+      - MAX_CONCURRENT_JOBS=1
+    networks:
+      - immich_network
+
+networks:
+  immich_network:
+    external: true
