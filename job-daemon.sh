@@ -98,7 +98,7 @@ manage_jobs() {
     fi
     
     # List of jobs to manage in priority order
-    priority_job_list="metadataExtraction sidecar storageTemplateMigration thumbnailGeneration smartSearch duplicateDetection faceDetection facialRecognition videoConversion"
+    priority_job_list="sidecar metadataExtraction storageTemplateMigration thumbnailGeneration smartSearch duplicateDetection faceDetection facialRecognition videoConversion"
     
     # Get all available jobs from the API response
     all_jobs=$(echo "$jobs" | jq -r 'keys[]' 2>/dev/null)
@@ -113,35 +113,69 @@ manage_jobs() {
         fi
     done
     
-    # Collect jobs with activity and unpause the first N jobs based on MAX_CONCURRENT_JOBS
-    jobs_to_unpause=""
-    jobs_unpaused=0
+    # Check if any jobs are currently actively running (active > 0)
+    # If yes, don't interrupt them - let them finish
+    has_active_jobs=0
+    currently_active_jobs=""
     
     for job in $managed_job_list; do
-        # Optimize: Get all counts in one jq call instead of 4 separate calls
         job_counts=$(echo "$jobs" | jq -r ".$job.jobCounts | \"\(.active // 0) \(.waiting // 0) \(.paused // 0) \(.delayed // 0)\"" 2>/dev/null)
         
         if [ -z "$job_counts" ]; then
             continue
         fi
         
-        # Parse the space-separated values
         set -- $job_counts
         active=$1
-        waiting=$2
-        paused=$3
-        delayed=$4
         
-        # Calculate total activity in one operation
-        total=$((active + waiting + paused + delayed))
-        
-        if [ "$total" -gt 0 ]; then
+        # If this job has active tasks, don't interrupt it
+        if [ "$active" -gt 0 ]; then
+            has_active_jobs=1
+            currently_active_jobs="$currently_active_jobs $job"
+        fi
+    done
+    
+    # Collect jobs with activity and unpause the first N jobs based on MAX_CONCURRENT_JOBS
+    jobs_to_unpause=""
+    jobs_unpaused=0
+    
+    # If there are active jobs, keep them running and don't start new ones
+    if [ "$has_active_jobs" -eq 1 ]; then
+        # Keep currently active jobs running
+        for job in $currently_active_jobs; do
             if [ "$jobs_unpaused" -lt "$MAX_CONCURRENT_JOBS" ]; then
                 jobs_to_unpause="$jobs_to_unpause $job"
                 jobs_unpaused=$((jobs_unpaused + 1))
             fi
-        fi
-    done
+        done
+    else
+        # No active jobs - select new jobs by priority
+        for job in $managed_job_list; do
+            # Get all counts in one jq call
+            job_counts=$(echo "$jobs" | jq -r ".$job.jobCounts | \"\(.active // 0) \(.waiting // 0) \(.paused // 0) \(.delayed // 0)\"" 2>/dev/null)
+            
+            if [ -z "$job_counts" ]; then
+                continue
+            fi
+            
+            # Parse the space-separated values
+            set -- $job_counts
+            active=$1
+            waiting=$2
+            paused=$3
+            delayed=$4
+            
+            # Calculate total activity in one operation
+            total=$((active + waiting + paused + delayed))
+            
+            if [ "$total" -gt 0 ]; then
+                if [ "$jobs_unpaused" -lt "$MAX_CONCURRENT_JOBS" ]; then
+                    jobs_to_unpause="$jobs_to_unpause $job"
+                    jobs_unpaused=$((jobs_unpaused + 1))
+                fi
+            fi
+        done
+    fi
     
     # Build new state string for comparison
     new_job_states=""

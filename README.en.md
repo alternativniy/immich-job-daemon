@@ -20,8 +20,8 @@ A daemon for managing Immich job queue. Automatically manages jobs by priority, 
 
 Jobs are processed in the following priority order:
 
-1. metadataExtraction
-2. sidecar
+1. sidecar
+2. metadataExtraction
 3. storageTemplateMigration
 4. thumbnailGeneration
 5. smartSearch
@@ -120,14 +120,26 @@ docker logs -f immich-job-daemon
 
 ## How It Works
 
-The daemon runs every 10 seconds:
+The daemon runs every N seconds (configurable via `POLL_INTERVAL`):
 
 1. Fetches all jobs from Immich API
-2. Finds the first N jobs from the priority list (where N = `MAX_CONCURRENT_JOBS`) that have activity
-3. Resumes these jobs
-4. Pauses all other managed jobs
+2. **Checks for actively running jobs** (active > 0)
+3. **If there are active jobs** - continues their execution until completion (does not interrupt)
+4. **If all jobs are paused** - finds the first N jobs from the priority list (where N = `MAX_CONCURRENT_JOBS`) that have tasks in queue
+5. Resumes selected jobs
+6. Pauses all other managed jobs
 
-This allows efficient server resource management by processing jobs sequentially or in parallel according to priority.
+This allows efficient server resource management by processing jobs sequentially or in parallel according to priority, **without interrupting already running jobs**.
+
+### 🔄 Priority Logic
+
+**Important:** The daemon does not interrupt running jobs! This is critical for jobs that generate data for other jobs.
+
+**Example:**
+- Job `thumbnailGeneration` is running (priority 4)
+- Data appears for `metadataExtraction` (priority 2, higher)
+- The daemon **WILL NOT interrupt** `thumbnailGeneration`, lets it finish
+- After all active jobs complete, it will start `metadataExtraction` by priority
 
 **Usage Examples:**
 
