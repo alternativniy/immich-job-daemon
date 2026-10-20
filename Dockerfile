@@ -31,11 +31,13 @@ USER immich
 # Set default environment variables (can be overridden at runtime)
 ENV IMMICH_URL=http://127.0.0.1:2283 \
   MAX_CONCURRENT_JOBS=1 \
-  POLL_INTERVAL=10
+  POLL_INTERVAL=10 \
+  STRICT_LIMIT=true \
+  IDLE_POLICY=resume
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD pgrep -f job-daemon.sh || exit 1
+# Health check: the last successful poll must be recent
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD /app/job-daemon.sh --healthcheck || exit 1
 
 # Run the daemon
 CMD ["/app/job-daemon.sh"]

@@ -13,6 +13,10 @@ services:
       - API_KEY=your_api_key_here
       - MAX_CONCURRENT_JOBS=1
       - POLL_INTERVAL=10
+      - STRICT_LIMIT=true
+      - IDLE_POLICY=resume
+      # Optional: override queue list / priority (space or comma separated)
+      # - MANAGED_QUEUES=library sidecar metadataExtraction storageTemplateMigration thumbnailGeneration smartSearch faceDetection ocr facialRecognition duplicateDetection videoConversion migration
     depends_on:
       - immich-server
     networks:

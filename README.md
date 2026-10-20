@@ -1,39 +1,47 @@
 # Immich Job Daemon
 
-**Русский | [English](README.en.md)**
+**English | [Русский](README.ru.md)**
 
 [![Docker Build](https://github.com/alternativniy/immich-job-daemon/actions/workflows/docker-build.yml/badge.svg)](https://github.com/alternativniy/immich-job-daemon/actions/workflows/docker-build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Docker Pulls](https://img.shields.io/docker/pulls/alternativniy/immich-job-daemon)](https://github.com/alternativniy/immich-job-daemon/pkgs/container/immich-job-daemon)
 
-Демон для управления очередью заданий Immich. Автоматически управляет заданиями по приоритету, позволяя запускать одновременно заданное количество заданий.
+A daemon that limits how many heavy Immich queues run at the same time. Immich only has per-queue concurrency settings ([discussion #3625](https://github.com/immich-app/immich/discussions/3625)); this daemon adds a global limit by pausing and resuming queues in pipeline priority order.
 
-## Особенности
+## Features
 
-- 🐧 Основан на Alpine Linux (минимальный размер образа)
-- 🔄 Автоматическое управление приоритетами заданий
-- ⚙️ Настраиваемое количество одновременных заданий
-- 🔒 Запуск от непривилегированного пользователя
-- 🌐 Настройка через переменные окружения
+- 🐧 Based on Alpine Linux (minimal image size)
+- 🔄 Pipeline-aware priority: new uploads get metadata and thumbnails first
+- ⚙️ Configurable number of concurrent queues
+- 🛡️ Never touches service queues (background tasks, search, notifications, ...)
+- ♻️ Resumes all queues on shutdown, nothing stays paused
+- 🔒 Runs as non-privileged user
+- 🌐 Configuration via environment variables
 
-## Приоритет заданий
+## Managed Queues
 
-Задания обрабатываются в следующем порядке приоритета:
+The daemon manages only the heavy queues shown on the `/admin/queues` page, in pipeline order (upstream first):
 
-1. sidecar
-2. metadataExtraction
-3. storageTemplateMigration
-4. thumbnailGeneration
-5. smartSearch
-6. duplicateDetection
-7. faceDetection
-8. facialRecognition
-9. videoConversion
-10. other jobs
+1. `library`
+2. `sidecar`
+3. `metadataExtraction`
+4. `storageTemplateMigration`
+5. `thumbnailGeneration`
+6. `smartSearch`
+7. `faceDetection`
+8. `ocr`
+9. `facialRecognition`
+10. `duplicateDetection`
+11. `videoConversion`
+12. `migration`
 
-## Использование
+The list and order can be changed with `MANAGED_QUEUES`. Queues missing on your Immich version are skipped.
 
-### Использование готового образа из GitHub Container Registry
+Service queues (`backgroundTask`, `search`, `notifications`, `backupDatabase`, `workflow`, `editor`, `integrityCheck`) are never paused. If one of them is left paused (e.g. by an older daemon version), it is resumed on startup.
+
+## Usage
+
+### Using Pre-built Image from GitHub Container Registry
 
 ```bash
 docker run -d \
@@ -45,7 +53,7 @@ docker run -d \
   ghcr.io/alternativniy/immich-job-daemon:latest
 ```
 
-### Сборка образа локально
+### Build Image Locally
 
 #### Docker Run
 
@@ -63,12 +71,13 @@ docker run -d \
 
 ### Docker Compose
 
-1. Отредактируйте `docker-compose.yml`:
+1. Edit `docker-compose.yml`:
+
    ```yaml
    services:
      immich-job-daemon:
        image: ghcr.io/alternativniy/immich-job-daemon:latest
-       # Или соберите локально:
+       # Or build locally:
        # build: .
        container_name: immich-job-daemon
        restart: unless-stopped
@@ -82,77 +91,79 @@ docker run -d \
          - immich_network
    ```
 
-2. Запустите контейнер:
+2. Start the container:
    ```bash
    docker-compose up -d
    ```
 
-> **📝 Примечание:** Демон зависит от `immich-server` и должен быть в той же Docker сети для доступа к API.
+> **📝 Note:** The daemon depends on `immich-server` and must be in the same Docker network to access the API.
 
-## Переменные окружения
+## Environment Variables
 
-| Переменная | Описание | По умолчанию | Обязательная |
-|-----------|----------|--------------|--------------|
-| `IMMICH_URL` | URL сервера Immich | `http://127.0.0.1:2283` | Нет |
-| `API_KEY` | API ключ Immich с разрешениями `job.read` и `job.create` | - | **Да** |
-| `MAX_CONCURRENT_JOBS` | Количество одновременно выполняемых заданий | `1` | Нет |
-| `POLL_INTERVAL` | Интервал опроса в секундах | `10` | Нет |
+| Variable | Description | Default | Required |
+|----------|-------------|---------|----------|
+| `IMMICH_URL` | Immich server URL | `http://127.0.0.1:2283` | No |
+| `API_KEY` | Immich admin API key (see permissions below) | - | **Yes** |
+| `MAX_CONCURRENT_JOBS` | Number of queues allowed to run at the same time | `1` | No |
+| `POLL_INTERVAL` | Polling interval in seconds | `10` | No |
+| `STRICT_LIMIT` | `true`: a queue starts only after running jobs of paused queues finish, so the limit is never exceeded. `false`: switch immediately, running jobs of paused queues finish in parallel | `true` | No |
+| `IDLE_POLICY` | `resume`: when there is no work, resume all managed queues so new jobs start instantly. `pause`: keep them paused, new jobs start on the next poll | `resume` | No |
+| `MANAGED_QUEUES` | Managed queues in priority order (space or comma separated) | see above | No |
+| `RESUME_UNMANAGED` | Resume paused unmanaged queues on startup | `true` | No |
 
-## Получение API ключа
+> **📝 Note:** `MAX_CONCURRENT_JOBS` limits the number of *queues*. Each queue still runs up to its own concurrency from **Administration → Settings → Job Settings** (e.g. thumbnails 3, metadata 5). For strictly one job at a time set the concurrency of the heavy queues to `1` there.
 
-1. Войдите в веб-интерфейс Immich
-2. Перейдите в **Account Settings** → **API Keys**
-3. Создайте новый API ключ с требуемыми разрешениями:
-   - ✅ `job.read` - для чтения статуса заданий
-   - ✅ `job.create` - для управления заданиями (pause/resume)
-4. Скопируйте и используйте его в переменной `API_KEY`
+## Getting API Key
 
-> **⚠️ Важно:** API ключ должен иметь разрешения `job.read` и `job.create`, иначе демон не сможет управлять заданиями.
+1. Log in to Immich web interface as an administrator
+2. Go to **Account Settings** → **API Keys**
+3. Create a new API key with required permissions:
+   - Immich 2.4 and newer: ✅ `queue.read`, ✅ `queue.update`
+   - Older versions: ✅ `job.read`, ✅ `job.create`
+4. Copy and use it in the `API_KEY` variable
 
-## Логи
+The daemon detects the API automatically: it uses `/api/queues` when available and falls back to the deprecated `/api/jobs`.
 
-Просмотр логов контейнера:
+> **⚠️ Upgrading:** Immich 2.4+ requires a key with `queue.read` and `queue.update`. An old key with only `job.*` permissions gets HTTP 403 and the daemon exits at startup with this error — create a new key or add the permissions to the existing one.
+
+## Logs
+
+View container logs:
 
 ```bash
 docker logs -f immich-job-daemon
 ```
 
-## Как это работает
+## How It Works
 
-Демон каждые N секунд (настраивается через `POLL_INTERVAL`):
+Every `POLL_INTERVAL` seconds the daemon:
 
-1. Получает список всех заданий из Immich API
-2. **Проверяет наличие активно выполняющихся заданий** (active > 0)
-3. **Если есть активные задания** - продолжает их выполнение до завершения (не прерывает)
-4. **Если все задания на паузе** - находит первые N заданий из списка приоритетов (где N = `MAX_CONCURRENT_JOBS`), у которых есть задачи в очереди
-5. Возобновляет выбранные задания
-6. Приостанавливает все остальные управляемые задания
+1. Reads the real state of all queues from the Immich API (no cached state, so manual changes in the UI, Immich's own pauses and failed requests are corrected on the next poll)
+2. Selects the first `MAX_CONCURRENT_JOBS` managed queues in priority order that have work (`waiting + active > 0`)
+3. Pauses all other managed queues
+4. Resumes the selected queues (with `STRICT_LIMIT=true` only while there are free slots: running jobs of just-paused queues occupy a slot until they finish)
+5. If no managed queue has work, resumes all of them (`IDLE_POLICY=resume`)
 
-Это позволяет эффективно управлять ресурсами сервера, обрабатывая задания последовательно или параллельно по приоритету, **при этом не прерывая уже выполняющиеся задачи**.
+Pausing a queue **does not interrupt** running jobs: the current job finishes, only new jobs are not picked up. This is why a higher-priority queue can preempt a lower one at any time.
 
-### 🔄 Логика работы с приоритетами
+**Example** (`MAX_CONCURRENT_JOBS=1`):
 
-**Важно:** Демон не прерывает выполняющиеся задания! Это критично для заданий, которые генерируют данные для других заданий.
+- `videoConversion` processes 500 videos
+- A new photo is uploaded, `metadataExtraction` gets a job
+- The daemon pauses `videoConversion`; its current video finishes
+- `metadataExtraction` starts, then `storageTemplateMigration`, `thumbnailGeneration`, ML jobs for the new photo
+- When they are done, `videoConversion` continues
 
-**Пример:**
-- Выполняется задание `thumbnailGeneration` (приоритет 4)
-- Появляются данные для `metadataExtraction` (приоритет 2, выше)
-- Демон **НЕ прервет** `thumbnailGeneration`, даст ему завершиться
-- После завершения всех активных заданий запустит `metadataExtraction` по приоритету
+On shutdown (`docker stop`) the daemon resumes all managed queues, so Immich keeps working without it.
 
-**Примеры использования:**
-- `MAX_CONCURRENT_JOBS=1` - задания выполняются строго последовательно (по умолчанию)
-- `MAX_CONCURRENT_JOBS=2` - два задания могут выполняться одновременно
-- `MAX_CONCURRENT_JOBS=3` - три задания могут выполняться одновременно
+## Requirements
 
-## Требования
+- Docker or Docker Compose
+- **Running Immich server** (`immich-server` container)
+- Access to Immich API
+- Valid Immich admin API key with `queue.read` and `queue.update` permissions (`job.read` and `job.create` for Immich < 2.4)
+- Container must be in the same Docker network as Immich
 
-- Docker или Docker Compose
-- **Запущенный сервер Immich** (контейнер `immich-server`)
-- Доступ к Immich API
-- Действительный API ключ Immich с разрешениями `job.read` и `job.create`
-- Контейнер должен находиться в той же Docker сети, что и Immich
-
-## Лицензия
+## License
 
 MIT

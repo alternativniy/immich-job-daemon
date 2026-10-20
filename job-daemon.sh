@@ -1,40 +1,205 @@
 #!/bin/sh
 
-# Configuration for the API endpoint and headers
-# These values should be provided via environment variables
+# Immich Job Daemon
+# Limits how many heavy Immich queues (the ones shown on /admin/queues) run at
+# the same time. Queues are selected by pipeline priority; pausing a queue never
+# interrupts a running job, it only stops new jobs from being picked up.
+
 IMMICH_URL="${IMMICH_URL:-http://127.0.0.1:2283}"
+IMMICH_URL="${IMMICH_URL%/}"
 API_KEY="${API_KEY:-}"
 MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-1}"
 POLL_INTERVAL="${POLL_INTERVAL:-10}"
-URL="${IMMICH_URL}/api/jobs"
+STRICT_LIMIT="${STRICT_LIMIT:-true}"
+IDLE_POLICY="${IDLE_POLICY:-resume}"
+RESUME_UNMANAGED="${RESUME_UNMANAGED:-true}"
+HEALTH_FILE="${HEALTH_FILE:-/tmp/immich-job-daemon.health}"
 
-# Variable to store previous job states
-PREV_JOB_STATES=""
+# Heavy queues in pipeline order (upstream first)
+DEFAULT_MANAGED_QUEUES="library sidecar metadataExtraction storageTemplateMigration thumbnailGeneration smartSearch faceDetection ocr facialRecognition duplicateDetection videoConversion migration"
+MANAGED_QUEUES=$(echo "${MANAGED_QUEUES:-$DEFAULT_MANAGED_QUEUES}" | tr ',' ' ')
 
-# Validate required environment variables
-if [ -z "$API_KEY" ]; then
-    echo "ERROR: API_KEY environment variable is required" >&2
-    exit 1
+# Docker health check mode: healthy if the last successful poll is recent enough
+if [ "$1" = "--healthcheck" ]; then
+    [ -f "$HEALTH_FILE" ] || exit 1
+    last=$(cat "$HEALTH_FILE")
+    [ $(($(date +%s) - last)) -le $((POLL_INTERVAL * 3 + 30)) ]
+    exit $?
 fi
 
-# Validate MAX_CONCURRENT_JOBS is a positive integer
-if ! echo "$MAX_CONCURRENT_JOBS" | grep -qE '^[1-9][0-9]*$'; then
-    echo "ERROR: MAX_CONCURRENT_JOBS must be a positive integer" >&2
-    exit 1
-fi
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
 
-# Validate POLL_INTERVAL is a positive integer
-if ! echo "$POLL_INTERVAL" | grep -qE '^[1-9][0-9]*$'; then
-    echo "ERROR: POLL_INTERVAL must be a positive integer" >&2
+fail() {
+    echo "ERROR: $*" >&2
     exit 1
-fi
+}
+
+# Validate configuration
+[ -n "$API_KEY" ] || fail "API_KEY environment variable is required"
+echo "$MAX_CONCURRENT_JOBS" | grep -qE '^[1-9][0-9]*$' || fail "MAX_CONCURRENT_JOBS must be a positive integer"
+echo "$POLL_INTERVAL" | grep -qE '^[1-9][0-9]*$' || fail "POLL_INTERVAL must be a positive integer"
+case "$STRICT_LIMIT" in true | false) ;; *) fail "STRICT_LIMIT must be 'true' or 'false'" ;; esac
+case "$IDLE_POLICY" in resume | pause) ;; *) fail "IDLE_POLICY must be 'resume' or 'pause'" ;; esac
+case "$RESUME_UNMANAGED" in true | false) ;; *) fail "RESUME_UNMANAGED must be 'true' or 'false'" ;; esac
+[ -n "$(echo $MANAGED_QUEUES)" ] || fail "MANAGED_QUEUES must not be empty"
+
+RESPONSE_FILE=$(mktemp) || fail "Unable to create temporary file"
+HTTP_CODE=""
+
+# Perform an API request: api METHOD PATH [JSON_BODY]
+# Sets HTTP_CODE ("000" on connection failure); response body goes to RESPONSE_FILE
+api() {
+    HTTP_CODE=$(curl -s -o "$RESPONSE_FILE" -w '%{http_code}' \
+        --connect-timeout 10 --max-time 30 \
+        -X "$1" "$IMMICH_URL$2" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $API_KEY" \
+        ${3:+-d} ${3:+"$3"}) || HTTP_CODE="000"
+    case "$HTTP_CODE" in 2??) return 0 ;; esac
+    return 1
+}
+
+in_list() {
+    case " $2 " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# Fetch queue state into STATE, one line per queue: "name isPaused active waiting"
+fetch_state() {
+    api GET "$LIST_PATH" || return 1
+    if [ "$API_MODE" = "queues" ]; then
+        filter='.[] | [.name, .isPaused, (.statistics.active // 0), ((.statistics.waiting // 0) + (.statistics.paused // 0))]'
+    else
+        filter='to_entries[] | [.key, .value.queueStatus.isPaused, (.value.jobCounts.active // 0), ((.value.jobCounts.waiting // 0) + (.value.jobCounts.paused // 0))]'
+    fi
+    STATE=$(jq -r "$filter | @tsv" "$RESPONSE_FILE" 2>/dev/null) || return 1
+    [ -n "$STATE" ]
+}
+
+# Print "isPaused active waiting" for a queue, empty if the queue does not exist
+queue_info() {
+    printf '%s\n' "$STATE" | awk -v name="$1" '$1 == name { print $2, $3, $4; exit }'
+}
+
+# Pause or resume a queue: set_paused NAME true|false
+set_paused() {
+    if [ "$API_MODE" = "queues" ]; then
+        api PUT "/api/queues/$1" "{\"isPaused\":$2}" && return 0
+    else
+        if [ "$2" = "true" ]; then cmd="pause"; else cmd="resume"; fi
+        api PUT "/api/jobs/$1" "{\"command\":\"$cmd\",\"force\":false}" && return 0
+    fi
+    log "ERROR: unable to set $1 isPaused=$2 (HTTP $HTTP_CODE): $(head -c 200 "$RESPONSE_FILE")" >&2
+    return 1
+}
+
+# Bring a queue to the wanted state: ensure NAME WANT_PAUSED IS_PAUSED [REASON]
+# The comparison is made against the real server state, so manual changes in the
+# UI, Immich's own pauses and failed requests are corrected on the next poll.
+ensure() {
+    [ "$2" = "$3" ] && return 0
+    set_paused "$1" "$2" || return 1
+    if [ "$2" = "true" ]; then
+        log "⏸️  Paused $1${4:+ ($4)}"
+    else
+        log "▶️  Resumed $1${4:+ ($4)}"
+    fi
+}
+
+# Resume all managed queues: resume_managed [REASON]
+resume_managed() {
+    reason="$1"
+    for queue in $MANAGED_QUEUES; do
+        info=$(queue_info "$queue")
+        [ -n "$info" ] || continue
+        set -- $info
+        ensure "$queue" false "$1" "$reason"
+    done
+}
+
+manage_queues() {
+    if ! fetch_state; then
+        log "WARNING: unable to fetch queue state (HTTP $HTTP_CODE)" >&2
+        return 1
+    fi
+
+    # Select the first N queues in priority order that have pending work
+    selected=""
+    selected_count=0
+    for queue in $MANAGED_QUEUES; do
+        info=$(queue_info "$queue")
+        [ -n "$info" ] || continue
+        set -- $info
+        if [ $(($2 + $3)) -gt 0 ] && [ "$selected_count" -lt "$MAX_CONCURRENT_JOBS" ]; then
+            selected="$selected $queue"
+            selected_count=$((selected_count + 1))
+        fi
+    done
+
+    # Nothing to do: keep queues resumed so new jobs start immediately
+    if [ "$selected_count" -eq 0 ]; then
+        [ "$IDLE_POLICY" = "resume" ] && resume_managed "idle"
+        return 0
+    fi
+
+    # Pause everything that is not selected. Running jobs of a paused queue keep
+    # going until they finish ("draining") and occupy a slot meanwhile.
+    draining=0
+    for queue in $MANAGED_QUEUES; do
+        in_list "$queue" "$selected" && continue
+        info=$(queue_info "$queue")
+        [ -n "$info" ] || continue
+        set -- $info
+        ensure "$queue" true "$1" "lower priority"
+        [ "$2" -gt 0 ] && draining=$((draining + 1))
+    done
+
+    # Selected queues that already run jobs keep their slot
+    running=0
+    for queue in $selected; do
+        set -- $(queue_info "$queue")
+        if [ "$2" -gt 0 ]; then
+            ensure "$queue" false "$1" "running"
+            running=$((running + 1))
+        fi
+    done
+
+    # Start the remaining selected queues while there are free slots
+    for queue in $selected; do
+        set -- $(queue_info "$queue")
+        [ "$2" -gt 0 ] && continue
+        if [ "$STRICT_LIMIT" = "false" ] || [ $((running + draining)) -lt "$MAX_CONCURRENT_JOBS" ]; then
+            ensure "$queue" false "$1" "pending: $3"
+            running=$((running + 1))
+        else
+            ensure "$queue" true "$1" "waiting for a free slot"
+        fi
+    done
+}
+
+cleanup() {
+    echo ""
+    log "🛑 Received shutdown signal, resuming managed queues..."
+    if fetch_state; then
+        resume_managed "shutdown"
+    else
+        log "WARNING: unable to fetch queue state, managed queues may stay paused" >&2
+    fi
+    rm -f "$RESPONSE_FILE" "$HEALTH_FILE"
+    exit 0
+}
 
 echo "Starting Immich Job Daemon..."
 echo "Immich URL: $IMMICH_URL"
-echo "Max concurrent jobs: $MAX_CONCURRENT_JOBS"
+echo "Max concurrent queues: $MAX_CONCURRENT_JOBS"
 echo "Poll interval: ${POLL_INTERVAL}s"
+echo "Strict limit: $STRICT_LIMIT"
+echo "Idle policy: $IDLE_POLICY"
+echo "Managed queues (by priority): $(echo $MANAGED_QUEUES)"
 
-# Check server availability
 echo "Checking Immich server availability..."
 if ! curl -s -f -o /dev/null --connect-timeout 10 "$IMMICH_URL/api/server/ping"; then
     echo "ERROR: Cannot connect to Immich server at $IMMICH_URL" >&2
@@ -46,181 +211,45 @@ if ! curl -s -f -o /dev/null --connect-timeout 10 "$IMMICH_URL/api/server/ping";
 fi
 echo "✓ Successfully connected to Immich server"
 
-# Verify API key by fetching jobs
+# Detect the API: /api/queues (Immich >= 2.4) or legacy /api/jobs
 echo "Verifying API key..."
-test_response=$(curl -s -w "%{http_code}" -o /dev/null -X GET "$URL" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json" \
--H "x-api-key: $API_KEY")
-
-if [ "$test_response" = "401" ] || [ "$test_response" = "403" ]; then
-    echo "ERROR: API key is invalid or does not have required permissions" >&2
-    echo "Please ensure the API key has 'job.read' and 'job.create' permissions" >&2
-    exit 1
-    elif [ "$test_response" != "200" ]; then
-    echo "WARNING: Unexpected response code: $test_response" >&2
+if api GET /api/queues; then
+    API_MODE="queues"
+    LIST_PATH="/api/queues"
+elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+    fail "API key is invalid or lacks permissions. Required: 'queue.read' and 'queue.update' (Immich >= 2.4)"
+elif api GET /api/jobs; then
+    API_MODE="legacy"
+    LIST_PATH="/api/jobs"
+elif [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+    fail "API key is invalid or lacks permissions. Required: 'job.read' and 'job.create' (Immich < 2.4)"
+else
+    fail "Unexpected response from Immich API (HTTP $HTTP_CODE)"
 fi
-echo "✓ API key verified successfully"
-echo ""
+echo "✓ API key verified successfully (API: $LIST_PATH)"
 
-# Function to fetch the current job statuses from the API
-fetch_jobs() {
-    curl -s -X GET "$URL" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json" \
-    -H "x-api-key: $API_KEY" 2>/dev/null
-}
-
-# Function to send a command to pause or resume a specific job via the API
-set_job() {
-    local job="$1"
-    local command="$2"
-    local payload='{"command":"'"$command"'","force":false}'
-    
-    curl -s -X PUT "$URL/$job" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json" \
-    -H "x-api-key: $API_KEY" \
-    -d "$payload" >/dev/null 2>&1
-    
-    if [ $? -ne 0 ]; then
-        echo "Error setting job $job to $command" >&2
-    fi
-}
-
-# Main logic to manage jobs
-manage_jobs() {
-    # Fetch all jobs from the API
-    jobs=$(fetch_jobs)
-    
-    if [ -z "$jobs" ] || [ "$jobs" = "{}" ]; then
-        return
-    fi
-    
-    # List of jobs to manage in priority order
-    priority_job_list="sidecar metadataExtraction storageTemplateMigration thumbnailGeneration smartSearch duplicateDetection faceDetection facialRecognition videoConversion"
-    
-    # Get all available jobs from the API response
-    all_jobs=$(echo "$jobs" | jq -r 'keys[]' 2>/dev/null)
-    
-    # Build complete managed job list: priority jobs first, then other jobs
-    # Use grep for faster lookups instead of nested loops
-    managed_job_list="$priority_job_list"
-    for job in $all_jobs; do
-        # Check if job is not in priority list using grep (O(n) instead of O(n²))
-        if ! echo " $priority_job_list " | grep -q " $job "; then
-            managed_job_list="$managed_job_list $job"
-        fi
-    done
-    
-    # Check if any jobs are currently actively running (active > 0)
-    # If yes, don't interrupt them - let them finish
-    has_active_jobs=0
-    currently_active_jobs=""
-    
-    for job in $managed_job_list; do
-        job_counts=$(echo "$jobs" | jq -r ".$job.jobCounts | \"\(.active // 0) \(.waiting // 0) \(.paused // 0) \(.delayed // 0)\"" 2>/dev/null)
-        
-        if [ -z "$job_counts" ]; then
-            continue
-        fi
-        
-        set -- $job_counts
-        active=$1
-        
-        # If this job has active tasks, don't interrupt it
-        if [ "$active" -gt 0 ]; then
-            has_active_jobs=1
-            currently_active_jobs="$currently_active_jobs $job"
-        fi
-    done
-    
-    # Collect jobs with activity and unpause the first N jobs based on MAX_CONCURRENT_JOBS
-    jobs_to_unpause=""
-    jobs_unpaused=0
-    
-    # If there are active jobs, keep them running and don't start new ones
-    if [ "$has_active_jobs" -eq 1 ]; then
-        # Keep currently active jobs running
-        for job in $currently_active_jobs; do
-            if [ "$jobs_unpaused" -lt "$MAX_CONCURRENT_JOBS" ]; then
-                jobs_to_unpause="$jobs_to_unpause $job"
-                jobs_unpaused=$((jobs_unpaused + 1))
-            fi
-        done
-    else
-        # No active jobs - select new jobs by priority
-        for job in $managed_job_list; do
-            # Get all counts in one jq call
-            job_counts=$(echo "$jobs" | jq -r ".$job.jobCounts | \"\(.active // 0) \(.waiting // 0) \(.paused // 0) \(.delayed // 0)\"" 2>/dev/null)
-            
-            if [ -z "$job_counts" ]; then
-                continue
-            fi
-            
-            # Parse the space-separated values
-            set -- $job_counts
-            active=$1
-            waiting=$2
-            paused=$3
-            delayed=$4
-            
-            # Calculate total activity in one operation
-            total=$((active + waiting + paused + delayed))
-            
-            if [ "$total" -gt 0 ]; then
-                if [ "$jobs_unpaused" -lt "$MAX_CONCURRENT_JOBS" ]; then
-                    jobs_to_unpause="$jobs_to_unpause $job"
-                    jobs_unpaused=$((jobs_unpaused + 1))
-                fi
-            fi
-        done
-    fi
-    
-    # Build new state string for comparison
-    new_job_states=""
-    
-    # Unpause selected jobs, pause all others in managed_job_list
-    for job in $managed_job_list; do
-        # Use grep for faster lookup (O(n) instead of O(n²))
-        if echo " $jobs_to_unpause " | grep -q " $job "; then
-            new_state="resume"
-        else
-            new_state="pause"
-        fi
-        
-        # Add to new state
-        new_job_states="${new_job_states}${job}:${new_state},"
-        
-        # Only execute command and log if state changed
-        if ! echo "$PREV_JOB_STATES" | grep -q "${job}:${new_state}"; then
-            if [ "$new_state" = "resume" ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] ▶️  Resuming job: $job"
-            else
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏸️  Pausing job: $job"
-            fi
-            set_job "$job" "$new_state"
-        fi
-    done
-    
-    # Update previous state
-    PREV_JOB_STATES="$new_job_states"
-}
-
-# Graceful shutdown handler
-cleanup() {
-    echo ""
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🛑 Received shutdown signal, exiting gracefully..."
-    exit 0
-}
-
-# Trap SIGTERM and SIGINT for graceful shutdown
 trap cleanup TERM INT
 
-# Run the job manager loop
+fetch_state || fail "Unable to read queue state"
+
+for queue in $MANAGED_QUEUES; do
+    [ -n "$(queue_info "$queue")" ] || echo "WARNING: queue '$queue' not found on this Immich version, skipping" >&2
+done
+
+# Queues that are not managed must never stay paused (e.g. left over by older versions)
+if [ "$RESUME_UNMANAGED" = "true" ]; then
+    printf '%s\n' "$STATE" | while read -r name paused active waiting; do
+        in_list "$name" "$MANAGED_QUEUES" && continue
+        ensure "$name" false "$paused" "unmanaged queue"
+    done
+fi
+
+echo ""
 echo "🚀 Job daemon started. Press Ctrl+C to stop."
 echo ""
 while true; do
-    manage_jobs
-    sleep "$POLL_INTERVAL"
+    manage_queues && date +%s >"$HEALTH_FILE"
+    # Run sleep in background so signals are handled immediately
+    sleep "$POLL_INTERVAL" &
+    wait $!
 done
