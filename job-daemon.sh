@@ -11,12 +11,12 @@ API_KEY="${API_KEY:-}"
 MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-1}"
 POLL_INTERVAL="${POLL_INTERVAL:-10}"
 STRICT_LIMIT="${STRICT_LIMIT:-true}"
-IDLE_POLICY="${IDLE_POLICY:-resume}"
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-1800}"
 RESUME_UNMANAGED="${RESUME_UNMANAGED:-true}"
 HEALTH_FILE="${HEALTH_FILE:-/tmp/immich-job-daemon.health}"
 
 # Heavy queues in pipeline order (upstream first)
-DEFAULT_MANAGED_QUEUES="library sidecar metadataExtraction storageTemplateMigration thumbnailGeneration smartSearch faceDetection ocr facialRecognition duplicateDetection videoConversion migration"
+DEFAULT_MANAGED_QUEUES="library sidecar metadataExtraction storageTemplateMigration thumbnailGeneration smartSearch faceDetection ocr facialRecognition duplicateDetection migration videoConversion"
 MANAGED_QUEUES=$(echo "${MANAGED_QUEUES:-$DEFAULT_MANAGED_QUEUES}" | tr ',' ' ')
 
 # Docker health check mode: healthy if the last successful poll is recent enough
@@ -41,7 +41,7 @@ fail() {
 echo "$MAX_CONCURRENT_JOBS" | grep -qE '^[1-9][0-9]*$' || fail "MAX_CONCURRENT_JOBS must be a positive integer"
 echo "$POLL_INTERVAL" | grep -qE '^[1-9][0-9]*$' || fail "POLL_INTERVAL must be a positive integer"
 case "$STRICT_LIMIT" in true | false) ;; *) fail "STRICT_LIMIT must be 'true' or 'false'" ;; esac
-case "$IDLE_POLICY" in resume | pause) ;; *) fail "IDLE_POLICY must be 'resume' or 'pause'" ;; esac
+echo "$DRAIN_TIMEOUT" | grep -qE '^[0-9]+$' || fail "DRAIN_TIMEOUT must be a non-negative integer"
 case "$RESUME_UNMANAGED" in true | false) ;; *) fail "RESUME_UNMANAGED must be 'true' or 'false'" ;; esac
 [ -n "$(echo $MANAGED_QUEUES)" ] || fail "MANAGED_QUEUES must not be empty"
 
@@ -96,28 +96,67 @@ set_paused() {
     return 1
 }
 
+# Queues paused by this daemon. Pauses made by someone else (Immich itself, e.g.
+# metadataExtraction during geodata import, or a user in the UI) are respected.
+OWNED_PAUSES=""
+# Draining queues and the time they started draining: "name=epoch ..."
+DRAIN_SINCE=""
+DRAIN_EXPIRED=""
+
+list_add() {
+    eval "in_list \"\$2\" \"\$$1\" || $1=\"\$$1 \$2\""
+}
+
+list_del() {
+    eval "_list=\$$1"
+    _result=""
+    for _item in $_list; do
+        [ "$_item" = "$2" ] || [ "${_item%%=*}" = "$2" ] || _result="$_result $_item"
+    done
+    eval "$1=\$_result"
+}
+
+is_external_pause() {
+    [ "$1" = "true" ] && ! in_list "$2" "$OWNED_PAUSES"
+}
+
 # Bring a queue to the wanted state: ensure NAME WANT_PAUSED IS_PAUSED [REASON]
-# The comparison is made against the real server state, so manual changes in the
-# UI, Immich's own pauses and failed requests are corrected on the next poll.
+# The comparison is made against the real server state, so failed requests are
+# retried on the next poll.
 ensure() {
     [ "$2" = "$3" ] && return 0
     set_paused "$1" "$2" || return 1
     if [ "$2" = "true" ]; then
+        list_add OWNED_PAUSES "$1"
         log "⏸️  Paused $1${4:+ ($4)}"
     else
+        list_del OWNED_PAUSES "$1"
         log "▶️  Resumed $1${4:+ ($4)}"
     fi
 }
 
-# Resume all managed queues: resume_managed [REASON]
-resume_managed() {
-    reason="$1"
-    for queue in $MANAGED_QUEUES; do
-        info=$(queue_info "$queue")
-        [ -n "$info" ] || continue
-        set -- $info
-        ensure "$queue" false "$1" "$reason"
+# Whether a paused queue with running jobs still occupies a slot: is_draining NAME ACTIVE
+# A queue stops counting after DRAIN_TIMEOUT seconds so a hung job can't block everything.
+is_draining() {
+    if [ "$2" -eq 0 ]; then
+        list_del DRAIN_SINCE "$1"
+        list_del DRAIN_EXPIRED "$1"
+        return 1
+    fi
+    since=""
+    for _item in $DRAIN_SINCE; do
+        [ "${_item%%=*}" = "$1" ] && since="${_item#*=}"
     done
+    if [ -z "$since" ]; then
+        since="$NOW"
+        DRAIN_SINCE="$DRAIN_SINCE $1=$NOW"
+    fi
+    [ "$DRAIN_TIMEOUT" -gt 0 ] && [ $((NOW - since)) -ge "$DRAIN_TIMEOUT" ] || return 0
+    if ! in_list "$1" "$DRAIN_EXPIRED"; then
+        DRAIN_EXPIRED="$DRAIN_EXPIRED $1"
+        log "WARNING: $1 has been finishing its jobs for over ${DRAIN_TIMEOUT}s, no longer counting it towards the limit" >&2
+    fi
+    return 1
 }
 
 manage_queues() {
@@ -125,6 +164,13 @@ manage_queues() {
         log "WARNING: unable to fetch queue state (HTTP $HTTP_CODE)" >&2
         return 1
     fi
+    NOW=$(date +%s)
+
+    # A queue resumed by someone else is no longer our pause
+    for queue in $OWNED_PAUSES; do
+        set -- $(queue_info "$queue")
+        [ "$1" = "true" ] || list_del OWNED_PAUSES "$queue"
+    done
 
     # Select the first N queues in priority order that have pending work
     selected=""
@@ -133,28 +179,34 @@ manage_queues() {
         info=$(queue_info "$queue")
         [ -n "$info" ] || continue
         set -- $info
+        is_external_pause "$1" "$queue" && continue
         if [ $(($2 + $3)) -gt 0 ] && [ "$selected_count" -lt "$MAX_CONCURRENT_JOBS" ]; then
             selected="$selected $queue"
             selected_count=$((selected_count + 1))
         fi
     done
 
-    # Nothing to do: keep queues resumed so new jobs start immediately
-    if [ "$selected_count" -eq 0 ]; then
-        [ "$IDLE_POLICY" = "resume" ] && resume_managed "idle"
-        return 0
-    fi
-
-    # Pause everything that is not selected. Running jobs of a paused queue keep
-    # going until they finish ("draining") and occupy a slot meanwhile.
+    # Pause other queues that have work. Empty queues stay resumed: they use no
+    # resources and Immich UI only offers "Missing"/"All" for non-paused queues.
+    # Running jobs of a paused queue keep going until they finish ("draining")
+    # and occupy a slot meanwhile.
     draining=0
     for queue in $MANAGED_QUEUES; do
-        in_list "$queue" "$selected" && continue
         info=$(queue_info "$queue")
         [ -n "$info" ] || continue
         set -- $info
-        ensure "$queue" true "$1" "lower priority"
-        [ "$2" -gt 0 ] && draining=$((draining + 1))
+        if in_list "$queue" "$selected"; then
+            list_del DRAIN_SINCE "$queue"
+            continue
+        fi
+        if ! is_external_pause "$1" "$queue"; then
+            if [ $(($2 + $3)) -gt 0 ]; then
+                ensure "$queue" true "$1" "lower priority"
+            else
+                ensure "$queue" false "$1" "no pending work"
+            fi
+        fi
+        is_draining "$queue" "$2" && draining=$((draining + 1))
     done
 
     # Selected queues that already run jobs keep their slot
@@ -182,9 +234,12 @@ manage_queues() {
 
 cleanup() {
     echo ""
-    log "🛑 Received shutdown signal, resuming managed queues..."
+    log "🛑 Received shutdown signal, resuming queues paused by the daemon..."
     if fetch_state; then
-        resume_managed "shutdown"
+        for queue in $OWNED_PAUSES; do
+            set -- $(queue_info "$queue")
+            ensure "$queue" false "$1" "shutdown"
+        done
     else
         log "WARNING: unable to fetch queue state, managed queues may stay paused" >&2
     fi
@@ -197,7 +252,7 @@ echo "Immich URL: $IMMICH_URL"
 echo "Max concurrent queues: $MAX_CONCURRENT_JOBS"
 echo "Poll interval: ${POLL_INTERVAL}s"
 echo "Strict limit: $STRICT_LIMIT"
-echo "Idle policy: $IDLE_POLICY"
+echo "Drain timeout: ${DRAIN_TIMEOUT}s"
 echo "Managed queues (by priority): $(echo $MANAGED_QUEUES)"
 
 echo "Checking Immich server availability..."
@@ -234,6 +289,12 @@ fetch_state || fail "Unable to read queue state"
 
 for queue in $MANAGED_QUEUES; do
     [ -n "$(queue_info "$queue")" ] || echo "WARNING: queue '$queue' not found on this Immich version, skipping" >&2
+done
+
+# Paused managed queues on startup are treated as left over by a previous run
+for queue in $MANAGED_QUEUES; do
+    set -- $(queue_info "$queue")
+    [ "$1" = "true" ] && list_add OWNED_PAUSES "$queue"
 done
 
 # Queues that are not managed must never stay paused (e.g. left over by older versions)

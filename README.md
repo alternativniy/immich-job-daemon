@@ -14,7 +14,8 @@ A daemon that limits how many heavy Immich queues run at the same time. Immich o
 - 🔄 Pipeline-aware priority: new uploads get metadata and thumbnails first
 - ⚙️ Configurable number of concurrent queues
 - 🛡️ Never touches service queues (background tasks, search, notifications, ...)
-- ♻️ Resumes all queues on shutdown, nothing stays paused
+- ♻️ Resumes its own pauses on shutdown, nothing stays paused
+- 🤝 Respects pauses made by Immich itself or by you in the UI
 - 🔒 Runs as non-privileged user
 - 🌐 Configuration via environment variables
 
@@ -32,8 +33,8 @@ The daemon manages only the heavy queues shown on the `/admin/queues` page, in p
 8. `ocr`
 9. `facialRecognition`
 10. `duplicateDetection`
-11. `videoConversion`
-12. `migration`
+11. `migration`
+12. `videoConversion`
 
 The list and order can be changed with `MANAGED_QUEUES`. Queues missing on your Immich version are skipped.
 
@@ -107,7 +108,7 @@ docker run -d \
 | `MAX_CONCURRENT_JOBS` | Number of queues allowed to run at the same time | `1` | No |
 | `POLL_INTERVAL` | Polling interval in seconds | `10` | No |
 | `STRICT_LIMIT` | `true`: a queue starts only after running jobs of paused queues finish, so the limit is never exceeded. `false`: switch immediately, running jobs of paused queues finish in parallel | `true` | No |
-| `IDLE_POLICY` | `resume`: when there is no work, resume all managed queues so new jobs start instantly. `pause`: keep them paused, new jobs start on the next poll | `resume` | No |
+| `DRAIN_TIMEOUT` | Seconds a paused queue with running jobs may occupy a slot. After that it is no longer counted, so a hung job can't block everything. `0` = no timeout | `1800` | No |
 | `MANAGED_QUEUES` | Managed queues in priority order (space or comma separated) | see above | No |
 | `RESUME_UNMANAGED` | Resume paused unmanaged queues on startup | `true` | No |
 
@@ -138,11 +139,15 @@ docker logs -f immich-job-daemon
 
 Every `POLL_INTERVAL` seconds the daemon:
 
-1. Reads the real state of all queues from the Immich API (no cached state, so manual changes in the UI, Immich's own pauses and failed requests are corrected on the next poll)
+1. Reads the real state of all queues from the Immich API (failed requests are retried on the next poll)
 2. Selects the first `MAX_CONCURRENT_JOBS` managed queues in priority order that have work (`waiting + active > 0`)
-3. Pauses all other managed queues
-4. Resumes the selected queues (with `STRICT_LIMIT=true` only while there are free slots: running jobs of just-paused queues occupy a slot until they finish)
-5. If no managed queue has work, resumes all of them (`IDLE_POLICY=resume`)
+3. Pauses the other managed queues that have work
+4. Keeps queues without work resumed: they use no resources, new jobs start immediately and the **Missing** / **All** buttons on `/admin/queues` stay available (Immich hides them for paused queues)
+5. Resumes the selected queues (with `STRICT_LIMIT=true` only while there are free slots: running jobs of just-paused queues occupy a slot until they finish or `DRAIN_TIMEOUT` expires)
+
+Pauses made by someone else are respected: Immich pauses `metadataExtraction` while importing reverse geocoding data, and you can pause a queue manually in the UI. The daemon only resumes queues it paused itself. Managed queues found paused at startup are treated as left over by a previous run and taken over.
+
+A queue without work may start a new job before the next poll. The overshoot is limited to the jobs already started at that moment; after that the queue is managed as usual. This is why `videoConversion`, the queue with the longest jobs, has the lowest priority.
 
 Pausing a queue **does not interrupt** running jobs: the current job finishes, only new jobs are not picked up. This is why a higher-priority queue can preempt a lower one at any time.
 
@@ -154,7 +159,7 @@ Pausing a queue **does not interrupt** running jobs: the current job finishes, o
 - `metadataExtraction` starts, then `storageTemplateMigration`, `thumbnailGeneration`, ML jobs for the new photo
 - When they are done, `videoConversion` continues
 
-On shutdown (`docker stop`) the daemon resumes all managed queues, so Immich keeps working without it.
+On shutdown (`docker stop`) the daemon resumes the queues it paused, so Immich keeps working without it.
 
 ## Requirements
 

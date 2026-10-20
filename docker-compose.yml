@@ -14,9 +14,9 @@ services:
       - MAX_CONCURRENT_JOBS=1
       - POLL_INTERVAL=10
       - STRICT_LIMIT=true
-      - IDLE_POLICY=resume
+      - DRAIN_TIMEOUT=1800
       # Optional: override queue list / priority (space or comma separated)
-      # - MANAGED_QUEUES=library sidecar metadataExtraction storageTemplateMigration thumbnailGeneration smartSearch faceDetection ocr facialRecognition duplicateDetection videoConversion migration
+      # - MANAGED_QUEUES=library sidecar metadataExtraction storageTemplateMigration thumbnailGeneration smartSearch faceDetection ocr facialRecognition duplicateDetection migration videoConversion
     depends_on:
       - immich-server
     networks:
